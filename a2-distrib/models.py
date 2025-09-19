@@ -85,10 +85,17 @@ class NeuralSentimentClassifier(SentimentClassifier):
 
     def predict(self, ex_words: List[str], has_typos: bool) -> int:
         # Convert words → indices
-        indices = [self.word_embeddings.word_indexer.index_of(w) for w in ex_words]
-        indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device).unsqueeze(0)  # (1, seq_len)
+        indices = []
+        for w in ex_words:
+            idx = self.word_embeddings.word_indexer.index_of(w)
+            if idx == -1:   # unseen word
+                idx = 1     # UNK
+            indices.append(idx)
+
+        # make into tensor
+        indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            log_probs = self.model(indices_tensor)  # (1, num_classes)
+            log_probs = self.model(indices_tensor)
         return int(torch.argmax(log_probs, dim=1).item())
 
 
