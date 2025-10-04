@@ -442,7 +442,7 @@ def train_classifier(args, train, dev):
     d_internal = 32       # attention projection size
     num_layers = 1        # number of Transformer layers
     lr = 1e-3             # learning rate
-    num_epochs = 1       # training epochs
+    num_epochs = 10       # training epochs
     task = args.task      # BEFORE or BEFOREAFTER
     use_positional = True # always use positional encoding
 
