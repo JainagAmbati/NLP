@@ -77,7 +77,7 @@ class AlwaysEntailedFactChecker(FactChecker):
 
 
 class WordRecallThresholdFactChecker(FactChecker):
-    def __init__(self, threshold=0.65):
+    def __init__(self, threshold=0.64):
         self.threshold = threshold
         self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
 
@@ -111,33 +111,102 @@ class WordRecallThresholdFactChecker(FactChecker):
         return "S" if best_score >= self.threshold else "NS"
 
 
+# class EntailmentFactChecker(FactChecker):
+#     def __init__(self, ent_model, threshold=0.65, overlap_prune=0.08):
+#         self.ent_model = ent_model
+#         self.threshold = threshold
+#         self.overlap_prune = overlap_prune
+#         self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+
+#     def _tokenize(self, text):
+#         doc = self.nlp(text.lower())
+#         tokens = [t.lemma_ for t in doc if t.is_alpha and not t.is_stop]
+#         return set(tokens)
+
+#     def predict(self, fact: str, passages: List[dict]) -> str:
+#         fact_tokens = self._tokenize(fact)
+#         if not fact_tokens:
+#             return "NS"
+#         max_prob = 0.0
+#         for passage in passages:
+#             sents = re.split(r'(?<=[.!?])\s+', passage["text"])
+#             for sent in sents:
+#                 sent_tokens = self._tokenize(sent)
+#                 if not sent_tokens:
+#                     continue
+#                 overlap = len(fact_tokens & sent_tokens) / len(fact_tokens)
+#                 if overlap < self.overlap_prune:
+#                     continue
+#                 prob = self.ent_model.check_entailment(sent.strip(), fact)
+#                 max_prob = max(max_prob, prob)
+#         return "S" if max_prob >= self.threshold else "NS"
+
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model, threshold=0.35, overlap_prune=0.08):
+    def __init__(self, ent_model):
+        """
+        ent_model: an instance of EntailmentModel (already wraps model + tokenizer)
+        """
         self.ent_model = ent_model
-        self.threshold = threshold
-        self.overlap_prune = overlap_prune
         self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
 
     def _tokenize(self, text):
+        # simple lemmatization-based tokenization for pruning/filtering if needed
         doc = self.nlp(text.lower())
         tokens = [t.lemma_ for t in doc if t.is_alpha and not t.is_stop]
         return set(tokens)
 
-    def predict(self, fact: str, passages: List[dict]) -> str:
-        fact_tokens = self._tokenize(fact)
-        if not fact_tokens:
-            return "NS"
-        max_prob = 0.0
-        for passage in passages:
-            sents = re.split(r'(?<=[.!?])\s+', passage["text"])
-            for sent in sents:
-                sent_tokens = self._tokenize(sent)
-                if not sent_tokens:
-                    continue
-                overlap = len(fact_tokens & sent_tokens) / len(fact_tokens)
-                if overlap < self.overlap_prune:
-                    continue
-                prob = self.ent_model.check_entailment(sent.strip(), fact)
-                max_prob = max(max_prob, prob)
-        return "S" if max_prob >= self.threshold else "NS"
+    def _split_sentences(self, text):
+        # Split text into sentences on punctuation, clean them
+        sents = re.split(r'(?<=[.!?])\s+', text)
+        #sents = [s.rstrip('.!?').strip() for s in sents if s.strip()]
+        return " ".join(sents)
 
+    def predict(self, fact: str, passages: List[dict]) -> str:
+        """
+        Discrete entailment-based classification:
+        - Get model logits for each (sentence, fact) pair.
+        - If any sentence is *predicted* as entailment (label=2), return 'S'.
+        - Otherwise return 'NS'.
+        """
+
+        # store whether any sentence supports the fact
+        entailed = False
+
+        for passage in passages:
+            sentences = self._split_sentences(passage["text"])
+            # sent_tokens_final = []
+            # for sent in sentences:
+            #     if not sent.strip():
+            #         continue
+            #     sent_tokens_final.append(sent)
+              
+            # sent = " ".join(sent_tokens_final)
+            with torch.no_grad():
+                inputs = self.ent_model.tokenizer(
+                    sentences,
+                    fact,
+                    return_tensors='pt',
+                    truncation=True,
+                    padding=True
+                )
+
+                if self.ent_model.cuda:
+                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
+
+                outputs = self.ent_model.model(**inputs)
+                logits = outputs.logits
+                pred_label = torch.argmax(logits, dim=-1).item()
+
+                # Model label order: [contradiction=0, neutral=1, entailment=2]
+                if pred_label == 2:  # entailment
+                    entailed = True
+
+                del inputs, outputs, logits
+                gc.collect()
+
+            
+            if entailed:
+                # early stop — any sentence entailing is enough
+                return "S"
+
+        return "S" if entailed else "NS"
