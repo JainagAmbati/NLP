@@ -1,35 +1,45 @@
+# factcheck.py
+
 import torch
 from typing import List
 import numpy as np
 import spacy
 import gc
 import re
-import string
-from sklearn.metrics import jaccard_score
-from sklearn.feature_extraction.text import CountVectorizer
-import torch.nn.functional as F
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+from collections import Counter
+import math
 
-nltk.download('stopwords', quiet=True)
-nltk.download('wordnet', quiet=True)
-STOPWORDS = set(stopwords.words('english'))
-LEMM = WordNetLemmatizer()
+#we will use spacy-based tokenization and stopwords
 
-
-def _normalize(text):
-    text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', '', text)
-    tokens = [LEMM.lemmatize(t) for t in text.split() if t not in STOPWORDS]
-    return tokens
-
+try:
+    _nlp_for_tokens = spacy.load('en_core_web_sm', disable=['parser', 'ner', 'lemmatizer'])
+    _spacy_stopwords = _nlp_for_tokens.Defaults.stop_words
+    
+except Exception:
+    # manually declaring few stopwords if spacy isn't available
+    _nlp_for_tokens = None
+    _spacy_stopwords = {
+        "a", "an", "the", "is", "are", "was", "were", "in", "on", "and", "or", "of", "to",
+        "for", "by", "with", "as", "that", "this", "it", "from", "at", "be", "has", "have",
+    }
+    
+_word_tokenizer_re = re.compile(r"[A-Za-z0-9']+")
 
 class FactExample(object):
+    """
+    :param fact: A string representing the fact to make a prediction on
+    :param passages: List[dict], where each dict has keys "title" and "text". "title" denotes the title of the
+    Wikipedia page it was taken from; you generally don't need to use this. "text" is a chunk of text, which may or
+    may not align with sensible paragraph or sentence boundaries
+    :param label: S, NS, or IR for Supported, Not Supported, or Irrelevant. Note that we will ignore the Irrelevant
+    label for prediction, so your model should just predict S or NS, but we leave it here so you can look at the
+    raw data.
+    """
     def __init__(self, fact: str, passages: List[dict], label: str):
         self.fact = fact
         self.passages = passages
         self.label = label
+
     def __repr__(self):
         return repr("fact=" + repr(self.fact) + "; label=" + repr(self.label) + "; passages=" + repr(self.passages))
 
@@ -42,133 +52,295 @@ class EntailmentModel(object):
 
     def check_entailment(self, premise: str, hypothesis: str):
         with torch.no_grad():
-            inputs = self.tokenizer(
-                premise,
-                hypothesis,
-                return_tensors='pt',
-                truncation=True,
-                padding=True
-            )
+            # Tokenize the premise and hypothesis
+            inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
             if self.cuda:
-                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                inputs = {key: value.to('cuda') for key, value in inputs.items()}
+            # Get the model's prediction
             outputs = self.model(**inputs)
             logits = outputs.logits
-            probs = F.softmax(logits, dim=-1).cpu().numpy()[0]
-            # Model label order: [contradiction, neutral, entailment]
-            entail_prob = float(probs[2])
-
-        del inputs, outputs, logits, probs
+            probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+            # Note that the labels are ["entailment", "neutral", "contradiction"]. There are a number of ways to map
+        # these logits or probabilities to classification decisions; you'll have to decide how you want to do this.
+        entail_probability = float(probs[0]) #index 0 indicates entailment
+        
+        # To prevent out-of-memory (OOM) issues during autograding, we explicitly delete
+        # objects inputs, outputs, logits, and any results that are no longer needed after the computation.
+        del inputs, outputs, logits
         gc.collect()
-        return entail_prob
+
+        # return something
+        return entail_probability
 
 
 class FactChecker(object):
+    """
+    Fact checker base type
+    """
+
     def predict(self, fact: str, passages: List[dict]) -> str:
+        """
+        Makes a prediction on the given sentence
+        :param fact: same as FactExample
+        :param passages: same as FactExample
+        :return: "S" (supported) or "NS" (not supported)
+        """
         raise Exception("Don't call me, call my subclasses")
 
 
 class RandomGuessFactChecker(FactChecker):
     def predict(self, fact: str, passages: List[dict]) -> str:
-        return np.random.choice(["S", "NS"])
+        prediction = np.random.choice(["S", "NS"])
+        return prediction
 
 
 class AlwaysEntailedFactChecker(FactChecker):
     def predict(self, fact: str, passages: List[dict]) -> str:
         return "S"
+    
+#define tokenizer and normalizer
+def _tokenize_and_normalize(text : str, remove_stopwords= True):
+    if text is None:
+        return []
+    tokens = _word_tokenizer_re.findall(text.lower())
+    
+    if remove_stopwords:
+        tokens = [t for t in tokens if t not in _spacy_stopwords]
+    return tokens
 
+#function for jaccard similarity
+def _jaccard(set_a, set_b):
+    if not set_a and not set_b:
+        return 1.0
+    if not set_a or not set_b:
+        return 0.0
+    
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    
+    return intersection / union if union > 0 else 0.0
+
+#calculate tfidf cosine similarity 
+def _tfidf_cosine_score(tokens_a, tokens_b):
+    terms = sorted(set(tokens_a) | set(tokens_b))
+    if not terms:
+        return 0.0
+    
+    idx = {t: i for i, t in enumerate(terms)}
+    
+    tf_a = np.zeros(len(terms), dtype=float)
+    tf_b = np.zeros(len(terms), dtype=float)
+    
+    #calculate term frequency
+    for t in tokens_a:
+        tf_a[idx[t]] += 1.0
+    for t in tokens_b:
+        tf_b[idx[t]] += 1.0
+        
+    #calculate document frequency
+    df = np.zeros(len(terms), dtype=float)
+    for i, t in enumerate(terms):
+        df[i] = int(t in set(tokens_a)) + int(t in set(tokens_b))
+        
+    #avoid division by zero
+    idf = np.log((2.0 + 1.0) / (df + 1.0)) + 1.0
+    
+    vec_a = tf_a * idf
+    vec_b = tf_b * idf
+
+    denom = (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(vec_a, vec_b) / denom)
 
 class WordRecallThresholdFactChecker(FactChecker):
-    def __init__(self, threshold=0.64):
+    def __init__(self, threshold: float = 0.65, remove_stopwords: bool = True):
         self.threshold = threshold
-        self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+        self.remove_stopwords = remove_stopwords
+        
+    def _score_fact_vs_text(self, fact: str, text: str):
+        fact_tokens = _tokenize_and_normalize(fact, remove_stopwords = self.remove_stopwords)
+        text_tokens = _tokenize_and_normalize(text, remove_stopwords = self.remove_stopwords)
+        set_fact = set(fact_tokens)
+        set_text = set(text_tokens)
+        
+        jacc = _jaccard(set_fact, set_text)
+        
+        tfidf_cos = _tfidf_cosine_score(fact_tokens, text_tokens)
 
-    def _tokenize(self, text):
-        doc = self.nlp(text.lower())
-        tokens = [t.lemma_ for t in doc if t.is_alpha and not t.is_stop]
-        return set(tokens)
+        # overlap_count / len(fact_tokens_unique)
+        recall = 0.0
+        if set_fact:
+            recall = len(set_fact & set_text) / float(len(set_fact))
 
-    def _recall_overlap(self, fact_tokens, sent_tokens):
-        if not fact_tokens:
-            return 0.0
-        return len(fact_tokens & sent_tokens) / len(fact_tokens)
-
+        # Combine signals in an empirically simple way: max of the three normalized measures
+        combined = max(jacc, tfidf_cos, recall)
+        return combined
+        
     def predict(self, fact: str, passages: List[dict]) -> str:
-        fact_tokens = self._tokenize(fact)
-        # print("facttokens:",fact_tokens)
-        if not fact_tokens:
+        
+        if fact is None or not passages: #there is nothing to compare
             return "NS"
+        
         best_score = 0.0
         for passage in passages:
-            sents = re.split(r'(?<=[.!?])\s+', passage["text"])
-            sent_tokens_final = []
-            for sent in sents:
-                sent_tokens = self._tokenize(sent)
-                if not sent_tokens:
-                    continue
-                sent_tokens_final.extend(sent_tokens)
-            score = self._recall_overlap(fact_tokens, set(sent_tokens_final))
-            # print("senttokens:",sent_tokens_final,score)
-            best_score = max(best_score, score)
+            sents = passage.get("text", "") or passage.get("sent", "") or ""
+            score = self._score_fact_vs_text(fact, sents)
+            if score > best_score:
+                best_score = score
+        # cleanup
+        gc.collect()
         return "S" if best_score >= self.threshold else "NS"
 
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model: EntailmentModel):
+    def __init__(self, ent_model, entailment_threshold: float = 0.8,
+                 prune_word_threshold: float = 0.7,
+                 remove_stopwords: bool = True):
+        
         self.ent_model = ent_model
-
-    def predict(self, fact: str, passages: List[dict]) -> str:
-
-      threshold = 0.6  
-
-      max_entailment = 0.0
-      # print("FACT:",fact)
-      for passage in passages:
-          # naive sentence splitter
-          text = passage['text'].replace('</s>', '').replace('<s>', '')
-          sentences = re.split(r'(?<=[.?!])\s+', text.strip())
-          for sent in sentences:
-              if not sent:
-                  continue
-              # print("SENT:",sent)
-              entail_prob = self.ent_model.check_entailment(sent, fact)
-              if entail_prob > max_entailment:
-                  max_entailment = entail_prob
-              if max_entailment >= threshold:
-                  print(max_entailment)
-                  return "S"
-      print(max_entailment)
-      return "NS"
-
-class EntailmentFactChecker_old58(FactChecker):
-    def __init__(self, ent_model, threshold=0.65):
-        self.ent_model = ent_model
-        self.threshold = threshold
-        self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
-
-    def _tokenize(self, text):
-        doc = self.nlp(text.lower())
-        tokens = [t.lemma_ for t in doc if t.is_alpha and not t.is_stop]
-        return set(tokens)
-
-    def predict(self, fact: str, passages: List[dict]) -> str:
-        fact_tokens = self._tokenize(fact)
+        self.entailment_threshold = entailment_threshold
+        self.prune_word_threshold = prune_word_threshold
+        self.remove_stopwords = remove_stopwords
+        
+        try:
+            self.nlp = spacy.load('en_core_web_sm', disable=['ner'])
+        except Exception:
+            # If spaCy model not available, create a blank English pipeline with sentencizer
+            nlp_tmp = spacy.blank("en")
+            sentencizer = nlp_tmp.add_pipe("sentencizer")
+            self.nlp = nlp_tmp
+            
+    #calculate max recall overlap between fact and any passage
+    def _max_word_recall(self, fact: str, passages: List[dict]) -> float:
+        
+        fact_tokens = set(_tokenize_and_normalize(fact, remove_stopwords=self.remove_stopwords))
+        best = 0.0
         if not fact_tokens:
-            return "NS"
-        max_prob = 0.0
-        print("FACT:",fact)
-        print("FACT tokens:",fact_tokens)
-        for passage in passages:
-            sents = re.split(r'(?<=[.!?])\s+', passage["text"])
-            for sent in sents:
-                sent_tokens = self._tokenize(sent)
-                if not sent_tokens:
-                    continue
-                print(sent.strip())
-                print(sent_tokens)
-                prob = self.ent_model.check_entailment(sent.strip(), fact)
+            return 0.0
+        for p in passages:
+            text = p.get("text", "") or p.get("sent", "") or ""
+            
+            try:
+                doc = self.nlp(text)
+                sents = [s.text for s in doc.sents]
+            except Exception:
                 
-                print(prob)
-                max_prob = max(max_prob, prob)
-            import sys
-            sys.exit(0)
-        return "S" if max_prob >= self.threshold else "NS"
+                sents = re.split(r'[.!?]\s+', text)
+            for s in sents:
+                s_tokens = set(_tokenize_and_normalize(s, remove_stopwords=self.remove_stopwords))
+                if not s_tokens:
+                    continue
+                recall = len(fact_tokens & s_tokens) / float(len(fact_tokens))
+                if recall > best:
+                    best = recall
+                    
+                    if best >= 1.0:
+                        return best
+        return best
+        
 
+    def predict(self, fact: str, passages: List[dict]) -> str:
+        if fact is None or not passages:
+            return "NS"
+
+        # prune cheaply
+        max_recall = self._max_word_recall(fact, passages)
+        if max_recall < self.prune_word_threshold:
+            return "NS"
+
+        best_entail_prob = 0.0
+        # sentence-split and check entailment
+        for p in passages:
+            text = p.get("text", "") or p.get("sent", "") or ""
+            try:
+                doc = self.nlp(text)
+                sents = [s.text.strip() for s in doc.sents if s.text.strip()]
+            except Exception:
+                sents = [s.strip() for s in re.split(r'[.!?]\s+', text) if s.strip()]
+
+            for sent in sents:
+                try:
+                    res = self.ent_model.check_entailment(premise=sent, hypothesis=fact)
+                except Exception:
+                    # In case of tokenization/model errors, skip this sentence
+                    continue
+                # res['probs'] assumed [p_entailment, p_neutral, p_contradiction]
+                if isinstance(res, dict):
+                    probs = res.get("probs", None)
+                else:
+                    # assume it's a float probability
+                    probs = [1 - res, res]
+                if probs is None:
+                    continue
+                p_entail = float(probs[0])
+                if p_entail > best_entail_prob:
+                    best_entail_prob = p_entail
+                    # early stop if confident
+                    if best_entail_prob >= 0.999:
+                        break
+            if best_entail_prob >= 0.999:
+                break
+
+        # cleanup
+        gc.collect()
+
+        return "S" if best_entail_prob >= self.entailment_threshold else "NS"
+
+
+# OPTIONAL
+class DependencyRecallThresholdFactChecker(FactChecker):
+    def __init__(self, threshold: float = 0.65):
+        self.nlp = spacy.load('en_core_web_sm')
+        self.threshold = threshold
+
+    def predict(self, fact: str, passages: List[dict]) -> str:
+        if fact is None or not passages:
+            return "NS"
+
+        fact_deps = self.get_dependencies(fact)
+        if not fact_deps:
+            return "NS"
+
+        best_score = 0.0
+        for p in passages:
+            text = p.get("text", "") or p.get("sent", "") or ""
+            doc = self.nlp(text)
+            for s in doc.sents:
+                sent_deps = self.get_dependencies(s.text)
+                if not sent_deps:
+                    continue
+                inter = len(fact_deps & sent_deps)
+                score = inter / float(len(fact_deps))
+                if score > best_score:
+                    best_score = score
+                    if best_score >= 1.0:
+                        break
+            if best_score >= 1.0:
+                break
+
+        # tunable threshold
+        #threshold = 0.5
+        return "S" if best_score >= threshold else "NS"
+
+    def get_dependencies(self, sent: str):
+        """
+        Returns a set of relevant dependencies from sent
+        :param sent: The sentence to extract dependencies from
+        :param nlp: The spaCy model to run
+        :return: A set of dependency relations as tuples (head, label, child) where the head and child are lemmatized
+        if they are verbs. This is filtered from the entire set of dependencies to reflect ones that are most
+        semantically meaningful for this kind of fact-checking
+        """
+        # Runs the spaCy tagger
+        processed_sent = self.nlp(sent)
+        relations = set()
+        for token in processed_sent:
+            ignore_dep = ['punct', 'ROOT', 'root', 'det', 'case', 'aux', 'auxpass', 'dep', 'cop', 'mark']
+            if token.is_punct or token.dep_ in ignore_dep:
+                continue
+            # Simplify the relation to its basic form (root verb form for verbs)
+            head = token.head.lemma_ if token.head.pos_ == 'VERB' else token.head.text
+            dependent = token.lemma_ if token.pos_ == 'VERB' else token.text
+            relation = (head, token.dep_, dependent)
+            relations.add(relation)
+        return relations
