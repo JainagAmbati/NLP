@@ -210,7 +210,7 @@ class EntailmentFactChecker(FactChecker):
         best_entail_score = 0.0
         print("FACT:",fact)
         for p in passages:
-            # ✅ USE REGEX SPLITTING INSTEAD OF NLTK
+
             sentences = split_into_sentences(p["text"])
 
             for sent in sentences[:5]:
@@ -219,113 +219,19 @@ class EntailmentFactChecker(FactChecker):
                 overlap = len(fact_words & sent_words) / max(len(fact_words), 1)
                 if overlap < self.prune_word_threshold:
                     continue
-                if overlap > 0.6:
-                    return "S"
 
                 # ---- Run entailment ----
                 entail_prob, neutral_prob, contra_prob = self.ent_model.check_entailment(sent, fact)
+                
                 print("SENT:",sent,entail_prob, neutral_prob, contra_prob)
                 if entail_prob > best_entail_score:
                     best_entail_score = entail_prob
                 if best_entail_score >= self.entailment_threshold:
                   return "S" 
+                
 
         return "S" if best_entail_score >= self.entailment_threshold else "NS"
 
-
-class EntailmentFactChecker_old(FactChecker):
-    def __init__(self, ent_model, entailment_threshold: float = 0.7,
-                 prune_word_threshold: float = 0.7,
-                 remove_stopwords: bool = True):
-        
-        self.ent_model = ent_model
-        self.entailment_threshold = entailment_threshold
-        self.prune_word_threshold = prune_word_threshold
-        self.remove_stopwords = remove_stopwords
-        
-        try:
-            self.nlp = spacy.load('en_core_web_sm', disable=['ner'])
-        except Exception:
-            # If spaCy model not available, create a blank English pipeline with sentencizer
-            nlp_tmp = spacy.blank("en")
-            sentencizer = nlp_tmp.add_pipe("sentencizer")
-            self.nlp = nlp_tmp
-            
-    #calculate max recall overlap between fact and any passage
-    def _max_word_recall(self, fact: str, passages: List[dict]) -> float:
-        
-        fact_tokens = set(_tokenize_and_normalize(fact, remove_stopwords=self.remove_stopwords))
-        best = 0.0
-        if not fact_tokens:
-            return 0.0
-        for p in passages:
-            text = p.get("text", "")
-            
-            try:
-                doc = self.nlp(text)
-                sents = [s.text for s in doc.sents]
-            except Exception:
-                
-                sents = re.split(r'[.!?]\s+', text)
-            for s in sents:
-                s_tokens = set(_tokenize_and_normalize(s, remove_stopwords=self.remove_stopwords))
-                if not s_tokens:
-                    continue
-                recall = len(fact_tokens & s_tokens) / float(len(fact_tokens))
-                if recall > best:
-                    best = recall
-                    
-                    if best >= 1.0:
-                        return best
-        return best
-        
-
-    def predict(self, fact: str, passages: List[dict]) -> str:
-        if fact is None or not passages:
-            return "NS"
-
-        # prune cheaply
-        max_recall = self._max_word_recall(fact, passages)
-        if max_recall < self.prune_word_threshold:
-            return "NS"
-
-        best_entail_prob = 0.0
-        # sentence-split and check entailment
-        for p in passages:
-            text = p.get("text", "") or p.get("sent", "") or ""
-            try:
-                doc = self.nlp(text)
-                sents = [s.text.strip() for s in doc.sents if s.text.strip()]
-            except Exception:
-                sents = [s.strip() for s in re.split(r'[.!?]\s+', text) if s.strip()]
-
-            for sent in sents:
-                try:
-                    res = self.ent_model.check_entailment(premise=sent, hypothesis=fact)
-                except Exception:
-                    # In case of tokenization/model errors, skip this sentence
-                    continue
-                # res['probs'] assumed [p_entailment, p_neutral, p_contradiction]
-                if isinstance(res, dict):
-                    probs = res.get("probs", None)
-                else:
-                    # assume it's a float probability
-                    probs = [1 - res, res]
-                if probs is None:
-                    continue
-                p_entail = float(probs[0])
-                if p_entail > best_entail_prob:
-                    best_entail_prob = p_entail
-                    # early stop if confident
-                    if best_entail_prob >= 0.999:
-                        break
-            if best_entail_prob >= 0.999:
-                break
-
-        # cleanup
-        gc.collect()
-
-        return "S" if best_entail_prob >= self.entailment_threshold else "NS"
 
 
 # OPTIONAL
