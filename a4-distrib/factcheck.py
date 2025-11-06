@@ -1,4 +1,3 @@
-# factcheck.py
 
 import torch
 from typing import List
@@ -192,11 +191,74 @@ class EntailmentModel(object):
 import re
 import torch.nn.functional as F
 
-def split_into_sentences(text: str):
+def split_into_sentences_old(text: str):
     # Split on ".", "?", "!" but keep things simple
     sentences = re.split(r'(?<=[.?!])\s+', text)
     # Clean whitespace and drop empty strings
     return [s.strip() for s in sentences if len(s.strip()) > 0]
+
+    #html tags, removing stop words
+
+import re
+
+# Optional: lazy load stopwords when needed
+# import nltk
+# from nltk.corpus import stopwords
+# nltk.download('stopwords', quiet=True)
+
+# import spacy
+
+
+def split_into_sentences(text: str, remove_stopwords=False, stopword_source="nltk"):
+    """
+    :param text: string to split
+    :param remove_stopwords: bool - whether to remove stopwords
+    :param stopword_source: "nltk" or "spacy"
+    :return: list of cleaned sentences
+    """
+
+    # Load stopwords based on option
+    if remove_stopwords:
+        if stopword_source.lower() == "nltk":
+            stop_set = set(stopwords.words("english"))
+        elif stopword_source.lower() == "spacy":
+            # lazy-load spacy model only once
+            global _spacy_model
+            try:
+                _spacy_model
+            except NameError:
+                _spacy_model = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+            stop_set = _spacy_model.Defaults.stop_words
+        else:
+            raise ValueError("stopword_source must be 'nltk' or 'spacy'")
+
+    # Remove <s> markers
+    text = re.sub(r"</?s>", " ", text)
+
+    # Remove brackets but **keep content**
+    text = re.sub(r"[()]", "", text)
+    text = re.sub(r"[\[\]]", "", text)
+
+    # DO NOT REMOVE NUMBERS (per your request)
+
+    # Normalize multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Split by . ? !
+    sentences = re.split(r'(?<=[.?!])\s+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
+
+    # Remove stopwords if chosen
+    if remove_stopwords:
+        cleaned = []
+        for sent in sentences:
+            words = sent.split()
+            filtered = [w for w in words if w.lower() not in stop_set]
+            if filtered:
+                cleaned.append(" ".join(filtered))
+        return cleaned
+
+    return sentences
 
 
 class EntailmentFactChecker(FactChecker):
@@ -211,26 +273,29 @@ class EntailmentFactChecker(FactChecker):
         print("FACT:",fact)
         for p in passages:
 
-            sentences = split_into_sentences(p["text"])
+            sentences = split_into_sentences_old(p["text"])
 
-            for sent in sentences[:5]:
+            for sent in sentences:
                 # ---- Word overlap pruning ----
-                sent_words = set(sent.lower().split())
-                overlap = len(fact_words & sent_words) / max(len(fact_words), 1)
-                if overlap < self.prune_word_threshold:
-                    continue
+                # sent_words = set(sent.lower().split())
+                # overlap = len(fact_words & sent_words) / max(len(fact_words), 1)
+                # if overlap < self.prune_word_threshold:
+                #     continue
 
                 # ---- Run entailment ----
                 entail_prob, neutral_prob, contra_prob = self.ent_model.check_entailment(sent, fact)
                 
-                print("SENT:",sent,entail_prob, neutral_prob, contra_prob)
-                if entail_prob > best_entail_score:
-                    best_entail_score = entail_prob
-                if best_entail_score >= self.entailment_threshold:
-                  return "S" 
+                # print("SENT:",sent,entail_prob, neutral_prob, contra_prob)
+                # if entail_prob > best_entail_score:
+                #     best_entail_score = entail_prob
+                # if best_entail_score >= self.entailment_threshold:
+                #   return "S" 
+                if entail_prob >= max(neutral_prob, contra_prob):
+                  return "S"
                 
 
-        return "S" if best_entail_score >= self.entailment_threshold else "NS"
+        # return "S" if best_entail_score >= self.entailment_threshold else "NS"
+        return "NS"
 
 
 
