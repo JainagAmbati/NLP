@@ -44,35 +44,6 @@ class FactExample(object):
         return repr("fact=" + repr(self.fact) + "; label=" + repr(self.label) + "; passages=" + repr(self.passages))
 
 
-class EntailmentModel(object):
-    def __init__(self, model, tokenizer, cuda=False):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.cuda = cuda
-
-    def check_entailment(self, premise: str, hypothesis: str):
-        with torch.no_grad():
-            # Tokenize the premise and hypothesis
-            inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
-            if self.cuda:
-                inputs = {key: value.to('cuda') for key, value in inputs.items()}
-            # Get the model's prediction
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
-            # Note that the labels are ["entailment", "neutral", "contradiction"]. There are a number of ways to map
-        # these logits or probabilities to classification decisions; you'll have to decide how you want to do this.
-        entail_probability = float(probs[0]) #index 0 indicates entailment
-        
-        # To prevent out-of-memory (OOM) issues during autograding, we explicitly delete
-        # objects inputs, outputs, logits, and any results that are no longer needed after the computation.
-        del inputs, outputs, logits
-        gc.collect()
-
-        # return something
-        return entail_probability
-
-
 class FactChecker(object):
     """
     Fact checker base type
@@ -184,7 +155,7 @@ class WordRecallThresholdFactChecker(FactChecker):
         
         best_score = 0.0
         for passage in passages:
-            sents = passage.get("text", "") or passage.get("sent", "") or ""
+            sents = passage.get("text", "")
             score = self._score_fact_vs_text(fact, sents)
             if score > best_score:
                 best_score = score
@@ -192,8 +163,78 @@ class WordRecallThresholdFactChecker(FactChecker):
         gc.collect()
         return "S" if best_score >= self.threshold else "NS"
 
+class EntailmentModel(object):
+    def __init__(self, model, tokenizer, cuda=False):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.cuda = cuda
+
+    def check_entailment(self, premise: str, hypothesis: str):
+      with torch.no_grad():
+          inputs = self.tokenizer(premise, hypothesis, return_tensors='pt', truncation=True, padding=True)
+          if self.cuda:
+              inputs = {key: value.to('cuda') for key, value in inputs.items()}
+          outputs = self.model(**inputs)
+          logits = outputs.logits
+
+      # logits → probabilities
+      probs = F.softmax(logits, dim=-1).cpu().numpy()[0]
+      entail_prob = probs[0]          # index 0 = entailment
+      neutral_prob = probs[1]
+      contradiction_prob = probs[2]
+
+      # CLEANUP – prevent memory issues
+      del inputs, outputs, logits
+      gc.collect()
+
+      return entail_prob, neutral_prob, contradiction_prob
+
+import re
+import torch.nn.functional as F
+
+def split_into_sentences(text: str):
+    # Split on ".", "?", "!" but keep things simple
+    sentences = re.split(r'(?<=[.?!])\s+', text)
+    # Clean whitespace and drop empty strings
+    return [s.strip() for s in sentences if len(s.strip()) > 0]
+
+
 class EntailmentFactChecker(FactChecker):
-    def __init__(self, ent_model, entailment_threshold: float = 0.8,
+    def __init__(self, ent_model, entailment_threshold: float = 0.45, prune_word_threshold: float = 0.15):
+        self.ent_model = ent_model
+        self.entailment_threshold = entailment_threshold
+        self.prune_word_threshold = prune_word_threshold
+
+    def predict(self, fact: str, passages: List[dict]) -> str:
+        fact_words = set(fact.lower().split())
+        best_entail_score = 0.0
+        print("FACT:",fact)
+        for p in passages:
+            # ✅ USE REGEX SPLITTING INSTEAD OF NLTK
+            sentences = split_into_sentences(p["text"])
+
+            for sent in sentences[:5]:
+                # ---- Word overlap pruning ----
+                sent_words = set(sent.lower().split())
+                overlap = len(fact_words & sent_words) / max(len(fact_words), 1)
+                if overlap < self.prune_word_threshold:
+                    continue
+                if overlap > 0.6:
+                    return "S"
+
+                # ---- Run entailment ----
+                entail_prob, neutral_prob, contra_prob = self.ent_model.check_entailment(sent, fact)
+                print("SENT:",sent,entail_prob, neutral_prob, contra_prob)
+                if entail_prob > best_entail_score:
+                    best_entail_score = entail_prob
+                if best_entail_score >= self.entailment_threshold:
+                  return "S" 
+
+        return "S" if best_entail_score >= self.entailment_threshold else "NS"
+
+
+class EntailmentFactChecker_old(FactChecker):
+    def __init__(self, ent_model, entailment_threshold: float = 0.7,
                  prune_word_threshold: float = 0.7,
                  remove_stopwords: bool = True):
         
@@ -218,7 +259,7 @@ class EntailmentFactChecker(FactChecker):
         if not fact_tokens:
             return 0.0
         for p in passages:
-            text = p.get("text", "") or p.get("sent", "") or ""
+            text = p.get("text", "")
             
             try:
                 doc = self.nlp(text)
