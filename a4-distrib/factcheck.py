@@ -289,7 +289,8 @@ class EntailmentFactChecker(FactChecker):
                 # if entail_prob > best_entail_score:
                 #     best_entail_score = entail_prob
                 # if best_entail_score >= self.entailment_threshold:
-                #   return "S" 
+                #   return "S"
+                print("SENT:",sent,entail_prob) 
                 if entail_prob >= max(neutral_prob, contra_prob):
                   return "S"
                 
